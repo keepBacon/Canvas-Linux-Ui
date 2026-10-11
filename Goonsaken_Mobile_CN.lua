@@ -1,4 +1,4 @@
--- Goonsaken Hub · 中文手机版 v3 性能与触控滚动修复 (based on NumanLUAU/Goonsaken-Hub, source 2026-05-13)
+-- Goonsaken Hub · 中文手机版 v4 杀手体力与 ESP 遮挡修复 (based on NumanLUAU/Goonsaken-Hub, source 2026-05-13)
 -- Community modification: UI localization + Android touch compatibility.
 -- No guarantee of executor compatibility or live-game feature support.
 local hubLoader = [[
@@ -1658,11 +1658,43 @@ end
 
 end -- scoped performance/UI helpers
 
--- 独立的玩家 ESP：杀手红色、幸存者绿色，屏幕外 100% 透明，屏幕内 15% 透明。
--- “视野中”按相机屏幕投影判断；隔墙但位于屏幕区域内仍会显示（ESP 穿墙特性）。
+-- 独立的玩家 ESP：杀手红色、幸存者绿色。
+-- 玩家可见性 = 位于屏幕内且相机至角色之间无实体障碍物（Raycast）。
+-- 遭墙体等物体遮挡或离开屏幕时 100% 透明；无遮挡 15% 透明。
 local PLAYER_ESP_ONSCREEN_ALPHA = 0.15
 local PLAYER_ESP_OFFSCREEN_ALPHA = 1
 local playerESPRecords = {}
+
+-- 手机端性能约束：共用记录内的 RaycastParams，不在每帧重建配置；
+-- 每位玩家最多 2 条射线（身体 + 头部），由既有 0.1s 调度器驱动。
+local function isPlayerVisibleFromCamera(record, camera, targetPosition)
+    local screenPoint, isOnScreen = camera:WorldToViewportPoint(targetPosition)
+    if not (isOnScreen and screenPoint.Z > 0) then return false end
+
+    local params = record.LOSParams
+    if not params then
+        params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.IgnoreWater = true
+        params.RespectCanCollide = true
+        record.LOSParams = params
+    end
+
+    -- 排除自己的角色和目标角色本体，否则会把目标身体错误判成遮挡。
+    local ownCharacter = LocalPlayer.Character
+    if record.LOSOwnCharacter ~= ownCharacter then
+        record.LOSOwnCharacter = ownCharacter
+        local excluded = { record.Character }
+        if ownCharacter then table.insert(excluded, ownCharacter) end
+        params.FilterDescendantsInstances = excluded
+    end
+
+    local origin = camera.CFrame.Position
+    local direction = targetPosition - origin
+    if direction.Magnitude <= 0.01 then return true end
+    local hit = Workspace:Raycast(origin, direction, params)
+    return hit == nil or hit.Distance >= direction.Magnitude - 0.25
+end
 
 local function getESPUsername(character)
     local player = Players:GetPlayerFromCharacter(character)
@@ -1743,17 +1775,24 @@ local function updatePlayerESP(record, camera)
         billboard.StudsOffsetWorldSpace = Vector3.new(0, root.Name == "Head" and -5 or -3.1, 0)
     end
 
-    local inViewport = false
+    local unobstructed = false
     if ESP.Enabled and camera and root and root:IsA("BasePart") then
-        local point, visible = camera:WorldToViewportPoint(root.Position)
-        inViewport = visible and point.Z > 0
+        unobstructed = isPlayerVisibleFromCamera(record, camera, root.Position)
+        -- 上半身露出掩体时也算可见，避免只测身体造成误判。
+        if not unobstructed then
+            local head = character:FindFirstChild("Head")
+            if head and head:IsA("BasePart") and head ~= root then
+                unobstructed = isPlayerVisibleFromCamera(record, camera, head.Position)
+            end
+        end
     end
 
-    local alpha = inViewport and PLAYER_ESP_ONSCREEN_ALPHA or PLAYER_ESP_OFFSCREEN_ALPHA
+    local alpha = unobstructed and PLAYER_ESP_ONSCREEN_ALPHA or PLAYER_ESP_OFFSCREEN_ALPHA
+    -- 无阻挡时显示，受墙体遮挡时隐藏。标签也遵守同一规则。
     highlight.FillTransparency = alpha
     highlight.OutlineTransparency = alpha
-    highlight.Enabled = inViewport
-    billboard.Enabled = inViewport
+    highlight.Enabled = unobstructed
+    billboard.Enabled = unobstructed
     record.UsernameLabel.TextTransparency = alpha
     record.RoleLabel.TextTransparency = alpha
     -- 标签描边同样遵循 15% / 100% 透明度。
@@ -2885,7 +2924,7 @@ if FluentLoaded then
     --------------------------------------------------------------------------
     Tabs.Game:AddToggle("ESPToggle", {
         Title = "ESP 透视（杀手红 / 幸存者绿）",
-        Description = "角色下方显示用户名和角色；屏幕内 15% 透明，屏幕外 100% 透明",
+        Description = "显示用户名与角色；无遮挡 15% 透明，墙体遮挡或屏幕外 100% 透明",
         Default = false,
         Callback = function(state)
             toggles.ESP = state
@@ -2904,35 +2943,138 @@ if FluentLoaded then
         end
     })
 
-    Tabs.Game:AddToggle("InfiniteStamina", {
-        Title = "无限体力（部分执行器支持）",
-        Default = false,
-        Callback = function(value)
-			if executor == "Xeno" or executor == "Velocity" or executor == "LX63" or executor == "Solara" then
-                Fluent:Notify({
-                    Title = "暂不支持",
-                    Content = "当前执行器不支持无限体力。",
-                    Duration = 6.5,
-                    Image = "lucide-leaf",
-                })
-				return
-			end
-            infinitestamina = value
-			task.spawn(function()
-            	while infinitestamina do
-            	    local Sprinting = game:GetService("ReplicatedStorage").Systems.Character.Game.Sprinting
-            	    local stamina = require(Sprinting)
-            	    stamina.StaminaLossDisabled = true
-            	    task.wait(0.5) -- adjust to avoid unnecessary performance hit
-            	end
+    -- v4: 角色切换/杀手回合会重新初始化 Sprinting 参数，单一标志位不够稳定。
+    -- 此处只有一个后台维护任务；关闭时按开启前的实际值恢复，不把 nil 强改为 false。
+    do
+        local controller = {
+            Enabled = false,
+            Generation = 0,
+            ModuleInstance = nil,
+            Module = nil,
+            Original = setmetatable({}, { __mode = "k" }),
+            LastWarnAt = -10,
+        }
 
-	            -- Restore default when turned off
-    	        local Sprinting = game:GetService("ReplicatedStorage").Systems.Character.Game.Sprinting
-    	        local stamina = require(Sprinting)
-    	        stamina.StaminaLossDisabled = false
-    	    end)
-    	end
-	})
+        function controller:FindSprintingModule()
+            local systems = game:GetService("ReplicatedStorage"):FindFirstChild("Systems")
+            local characters = systems and (systems:FindFirstChild("Character") or systems:FindFirstChild("character"))
+            local gameFolder = characters and (characters:FindFirstChild("Game") or characters:FindFirstChild("game"))
+            return gameFolder and (gameFolder:FindFirstChild("Sprinting") or gameFolder:FindFirstChild("sprinting"))
+        end
+
+        function controller:Resolve()
+            local moduleInstance = self:FindSprintingModule()
+            if not moduleInstance then
+                self.Module = nil
+                self.ModuleInstance = nil
+                return nil
+            end
+            if moduleInstance == self.ModuleInstance and type(self.Module) == "table" then
+                return self.Module
+            end
+            local ok, module = pcall(require, moduleInstance)
+            if not ok or type(module) ~= "table" then
+                self.Module = nil
+                if os.clock() - self.LastWarnAt > 8 then
+                    self.LastWarnAt = os.clock()
+                    warn("[Goonsaken] Sprinting 模块不可用（执行器可能不支持 require）：", module)
+                end
+                return nil
+            end
+            self.ModuleInstance = moduleInstance
+            self.Module = module
+            return module
+        end
+
+        function controller:Apply()
+            if not self.Enabled then return end
+            local module = self:Resolve()
+            if not module or not self.Enabled then return end
+            if not self.Original[module] then
+                -- value 字段以表包裹，能区分原来的 nil 与 false。
+                local snapshot = {}
+                for _, key in ipairs({"StaminaLossDisabled", "StaminaLoss", "StaminaGain"}) do
+                    snapshot[key] = { value = module[key] }
+                end
+                self.Original[module] = snapshot
+            end
+            if module.StaminaLossDisabled ~= true then module.StaminaLossDisabled = true end
+            if type(module.StaminaLoss) == "number" and module.StaminaLoss ~= 0 then
+                module.StaminaLoss = 0
+            end
+            local maximum = module.MaxStamina
+            if type(maximum) ~= "number" or maximum <= 0 then maximum = 100 end
+            -- 杀手原版体力上限通常高于幸存者：不强制覆盖 MaxStamina。
+            local gain = math.max(maximum * 6, 200)
+            if type(module.StaminaGain) == "number" and module.StaminaGain < gain then
+                module.StaminaGain = gain
+            end
+            if type(module.Stamina) == "number" and module.Stamina < maximum then
+                module.Stamina = maximum
+                local changed = module.__staminaChangedEvent
+                if changed then
+                    pcall(function()
+                        if type(changed.Fire) == "function" then changed:Fire() end
+                    end)
+                end
+            end
+        end
+
+        function controller:Restore()
+            for module, snapshot in pairs(self.Original) do
+                for key, entry in pairs(snapshot) do
+                    pcall(function() module[key] = entry.value end)
+                end
+                self.Original[module] = nil
+            end
+            self.Module = nil
+            self.ModuleInstance = nil
+        end
+
+        function controller:SetEnabled(state)
+            state = not not state
+            if self.Enabled == state then return end
+            self.Enabled = state
+            self.Generation += 1
+            local generation = self.Generation
+            if not state then
+                self:Restore()
+                return
+            end
+            -- 开关即时响应；游戏回合或角色重新加载时每 0.15s 自恢复。
+            pcall(function() self:Apply() end)
+            task.spawn(function()
+                while self.Enabled and self.Generation == generation do
+                    local ok, err = pcall(function() self:Apply() end)
+                    if not ok and os.clock() - self.LastWarnAt > 8 then
+                        self.LastWarnAt = os.clock()
+                        warn("[Goonsaken] 无限体力维护失败：", err)
+                    end
+                    task.wait(0.15)
+                end
+            end)
+        end
+
+        -- 重新出生/切换杀手或幸存者时保留开关状态并刷新模块引用。
+        LocalPlayer.CharacterAdded:Connect(function()
+            controller.Module = nil
+            controller.ModuleInstance = nil
+            if controller.Enabled then
+                task.defer(function()
+                    if controller.Enabled then pcall(function() controller:Apply() end) end
+                end)
+            end
+        end)
+
+        Tabs.Game:AddToggle("InfiniteStamina", {
+            Title = "无限体力（杀手 / 幸存者）",
+            Description = "持续维护体力，回合切换后自动恢复；需要执行器支持 require",
+            Default = false,
+            Callback = function(value)
+                controller:SetEnabled(value)
+            end
+        })
+    end
 	
     -- Auto Rejoin on Kick (default ON)
     Tabs.Game:AddToggle("AutoRejoinToggle", {
