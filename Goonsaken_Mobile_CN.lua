@@ -1647,40 +1647,178 @@ local function applyTrapsandSpikesESP(color)
     end
 end
 
+-- 独立的玩家 ESP：杀手红色、幸存者绿色，屏幕外 100% 透明，屏幕内 15% 透明。
+-- “视野中”按相机屏幕投影判断；隔墙但位于屏幕区域内仍会显示（ESP 穿墙特性）。
+local PLAYER_ESP_ONSCREEN_ALPHA = 0.15
+local PLAYER_ESP_OFFSCREEN_ALPHA = 1
+local playerESPRecords = {}
+
+local function getESPUsername(character)
+    local player = Players:GetPlayerFromCharacter(character)
+    if player then
+        return player.Name
+    end
+    for _, name in ipairs({ "Username", "UserName", "PlayerName" }) do
+        local value = character:GetAttribute(name)
+        if type(value) == "string" and value ~= "" then
+            return value
+        end
+    end
+    local matchingPlayer = Players:FindFirstChild(character.Name)
+    if matchingPlayer and matchingPlayer:IsA("Player") then
+        return matchingPlayer.Name
+    end
+    return "未知玩家"
+end
+
+local function getESPRole(character)
+    -- Forsaken 使用角色名称命名 Workspace.Players.Killers/Survivors 下的模型。
+    local characterName = character:GetAttribute("CharacterName")
+    if type(characterName) == "string" and characterName ~= "" then
+        return characterName
+    end
+    local role = character:GetAttribute("Role")
+    if type(role) == "string" and role ~= "" then
+        return role
+    end
+    return character.Name
+end
+
+local function createESPText(parent, y, color)
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -8, 0, 20)
+    label.Position = UDim2.fromOffset(4, y)
+    label.BackgroundTransparency = 1
+    label.Font = Enum.Font.GothamMedium
+    label.TextSize = 13
+    label.TextXAlignment = Enum.TextXAlignment.Center
+    label.TextYAlignment = Enum.TextYAlignment.Center
+    label.TextColor3 = color
+    label.TextStrokeColor3 = Color3.new(0, 0, 0)
+    label.TextStrokeTransparency = 0.15
+    label.TextTransparency = PLAYER_ESP_OFFSCREEN_ALPHA
+    label.TextTruncate = Enum.TextTruncate.AtEnd
+    label.Parent = parent
+    return label
+end
+
+local function updatePlayerESP(record, camera)
+    local character = record.Character
+    local highlight = record.Highlight
+    local billboard = record.Billboard
+    if not character.Parent or not highlight.Parent or not billboard.Parent then
+        return false
+    end
+
+    -- 每次刷新角色名称/阵营，以兼容换角色与中途回合变化。
+    local side = character.Parent.Name
+    local color = side == "Killers" and COLOR_KILLER or COLOR_SURVIVOR
+    if highlight.FillColor ~= color then highlight.FillColor = color end
+    if highlight.OutlineColor ~= color then highlight.OutlineColor = color end
+    if record.RoleLabel.TextColor3 ~= color then record.RoleLabel.TextColor3 = color end
+
+    local username = "用户名：" .. getESPUsername(character)
+    local role = "角色：" .. getESPRole(character)
+    if record.UsernameLabel.Text ~= username then record.UsernameLabel.Text = username end
+    if record.RoleLabel.Text ~= role then record.RoleLabel.Text = role end
+
+    local root = character:FindFirstChild("HumanoidRootPart") or character:FindFirstChild("Head")
+    if root and billboard.Adornee ~= root then
+        billboard.Adornee = root
+        billboard.StudsOffsetWorldSpace = Vector3.new(0, root.Name == "Head" and -5 or -3.1, 0)
+    end
+
+    local inViewport = false
+    if ESP.Enabled and camera and root and root:IsA("BasePart") then
+        local point, visible = camera:WorldToViewportPoint(root.Position)
+        inViewport = visible and point.Z > 0
+    end
+
+    local alpha = inViewport and PLAYER_ESP_ONSCREEN_ALPHA or PLAYER_ESP_OFFSCREEN_ALPHA
+    highlight.FillTransparency = alpha
+    highlight.OutlineTransparency = alpha
+    highlight.Enabled = inViewport
+    billboard.Enabled = inViewport
+    record.UsernameLabel.TextTransparency = alpha
+    record.RoleLabel.TextTransparency = alpha
+    -- 标签描边同样遵循 15% / 100% 透明度。
+    record.UsernameLabel.TextStrokeTransparency = alpha
+    record.RoleLabel.TextStrokeTransparency = alpha
+    return true
+end
+
 local function applyPlayerESP(character, color)
-    if not character:IsA("Model") then return end
-	if not game.Players:GetPlayerFromCharacter(character) then return end
-    if character:FindFirstChild(PLAYER_ESP_NAME) then return end
+    if not character:IsA("Model") or character == LocalPlayer.Character then return end
+    if character.Parent == nil then return end
+    if not character:FindFirstChild("HumanoidRootPart") and not character:FindFirstChild("Head") then
+        return -- 刚出生时延后到下次扫描，不阻塞线程
+    end
 
-	if character == LocalPlayer.Character then return end
+    local record = playerESPRecords[character]
+    if record and record.Highlight.Parent and record.Billboard.Parent then
+        -- 继续使用原来的对象；updatePlayerESP 会处理角色换边。
+        return
+    end
+    playerESPRecords[character] = nil
 
-    local highlight = Instance.new("Highlight")
+    local existingHighlight = character:FindFirstChild(PLAYER_ESP_NAME)
+    if existingHighlight and not existingHighlight:IsA("Highlight") then
+        existingHighlight:Destroy()
+        existingHighlight = nil
+    end
+    local highlight = existingHighlight or Instance.new("Highlight")
     highlight.Name = PLAYER_ESP_NAME
-    highlight.FillColor = color
     highlight.Adornee = character
+    highlight.FillColor = color
+    highlight.OutlineColor = color
+    highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    highlight.FillTransparency = PLAYER_ESP_OFFSCREEN_ALPHA
+    highlight.OutlineTransparency = PLAYER_ESP_OFFSCREEN_ALPHA
+    highlight.Enabled = false
     highlight.Parent = character
-
-	local billboard = Instance.new("BillboardGui", character:WaitForChild("Head"))
-	billboard.Name = "PlayerESPBillboard"
-	billboard.Size = UDim2.new(0, 100, 0, 50)
-	billboard.StudsOffset = Vector3.new(0, 2, 0)
-	local textLabel = Instance.new("TextLabel", billboard)
-	textLabel.Size = UDim2.new(1, 0, 1, 0)
-	textLabel.Text = "(" .. tostring(character.Name) .. ") " .. tostring(character:GetAttribute("Username")) 
-	textLabel.TextColor3 = Color3.new(1, 1, 1)
-	textLabel.TextStrokeTransparency = 0
-	textLabel.TextStrokeColor3 = Color3.new(0, 0, 0)
-	billboard.AlwaysOnTop = true
-	textLabel.BackgroundTransparency = 1
-    -- Set initial visibility
-    setHighlightVisibility(highlight, ESP.Enabled)
     allHighlights[highlight] = true
 
-    -- Remove old Highlight if exists
-    if character:FindFirstChild("Highlight") then
-        character.Highlight:Destroy()
-    end
+    local previousBillboard = character:FindFirstChild("PlayerESPBillboard", true)
+    if previousBillboard then previousBillboard:Destroy() end
+
+    local root = character:FindFirstChild("HumanoidRootPart") or character:FindFirstChild("Head")
+    local billboard = Instance.new("BillboardGui")
+    billboard.Name = "PlayerESPBillboard"
+    billboard.Adornee = root
+    billboard.Size = UDim2.fromOffset(205, 42)
+    billboard.StudsOffsetWorldSpace = Vector3.new(0, root.Name == "Head" and -5 or -3.1, 0)
+    billboard.AlwaysOnTop = true
+    billboard.Enabled = false
+    billboard.MaxDistance = 5000
+    billboard.Parent = root
+
+    local usernameLabel = createESPText(billboard, 0, Color3.fromRGB(245, 245, 245))
+    usernameLabel.Name = "Username"
+    local roleLabel = createESPText(billboard, 20, color)
+    roleLabel.Name = "Role"
+
+    record = {
+        Character = character,
+        Highlight = highlight,
+        Billboard = billboard,
+        UsernameLabel = usernameLabel,
+        RoleLabel = roleLabel,
+    }
+    playerESPRecords[character] = record
+    updatePlayerESP(record, Workspace.CurrentCamera)
 end
+
+-- 固定最多约 10 次/秒检查屏幕投影，避免在手机端逐帧扫描地图。
+runEvery(0.1, function()
+    if not ESP.Enabled then return end
+    local camera = Workspace.CurrentCamera
+    for character, record in pairs(playerESPRecords) do
+        if not updatePlayerESP(record, camera) then
+            allHighlights[record.Highlight] = nil
+            playerESPRecords[character] = nil
+        end
+    end
+end)
 
 -- Item ESP
 local function applyItemHighlight(tool, color)
@@ -1784,6 +1922,18 @@ workspace.DescendantAdded:Connect(function(obj)
 end)
 
 runEvery(0.5, function()
+    -- 回合切换时回收旧角色 ESP，避免多局游戏后累积失效对象。
+    for character, record in pairs(playerESPRecords) do
+        if not character:IsDescendantOf(PlayersFolder)
+            or not record.Highlight.Parent
+            or not record.Billboard.Parent then
+            allHighlights[record.Highlight] = nil
+            if record.Highlight.Parent then record.Highlight:Destroy() end
+            if record.Billboard.Parent then record.Billboard:Destroy() end
+            playerESPRecords[character] = nil
+        end
+    end
+
     local survivors = PlayersFolder:FindFirstChild("Survivors")
     if survivors then
         for _, char in ipairs(survivors:GetChildren()) do
@@ -1845,19 +1995,20 @@ end)
 
 -- Function to toggle ESP on/off
 function ESP:SetEnabled(state)
-    ESP.Enabled = state
-    for highlight,_ in pairs(allHighlights) do
-        setHighlightVisibility(highlight, state)
+    ESP.Enabled = not not state
+    -- 非玩家高亮维持原来的逻辑；玩家高亮使用屏幕内 15% / 屏幕外 100%。
+    for highlight in pairs(allHighlights) do
+        if highlight.Parent == nil then
+            allHighlights[highlight] = nil
+        elseif highlight.Name ~= PLAYER_ESP_NAME then
+            setHighlightVisibility(highlight, ESP.Enabled)
+        end
     end
-	local LocalPlayersFolder = game.Workspace:FindFirstChild("Players")
-    if LocalPlayersFolder then
-        for _, LocalPlayerType in pairs(LocalPlayersFolder:GetChildren()) do -- Survivors, Killers folders etc.
-            for _, char in pairs(LocalPlayerType:GetChildren()) do
-                local billboard = char:FindFirstChild("PlayerESPBillboard", true) -- recursive search
-                if billboard then
-                    billboard.Enabled = state
-                end
-            end
+    local camera = Workspace.CurrentCamera
+    for character, record in pairs(playerESPRecords) do
+        if not updatePlayerESP(record, camera) then
+            allHighlights[record.Highlight] = nil
+            playerESPRecords[character] = nil
         end
     end
 end
@@ -2715,7 +2866,8 @@ if FluentLoaded then
     -- Game Tab
     --------------------------------------------------------------------------
     Tabs.Game:AddToggle("ESPToggle", {
-        Title = "ESP 透视",
+        Title = "ESP 透视（杀手红 / 幸存者绿）",
+        Description = "角色下方显示用户名和角色；屏幕内 15% 透明，屏幕外 100% 透明",
         Default = false,
         Callback = function(state)
             toggles.ESP = state
