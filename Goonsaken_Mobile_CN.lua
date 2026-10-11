@@ -1,4 +1,4 @@
--- Goonsaken Hub · 中文手机版 (based on NumanLUAU/Goonsaken-Hub, source 2026-05-13)
+-- Goonsaken Hub · 中文手机版 v3 性能与触控滚动修复 (based on NumanLUAU/Goonsaken-Hub, source 2026-05-13)
 -- Community modification: UI localization + Android touch compatibility.
 -- No guarantee of executor compatibility or live-game feature support.
 local hubLoader = [[
@@ -1576,76 +1576,87 @@ end
 -- Player ESP
 local PlayersFolder = Workspace:WaitForChild("Players")
 
-local function applyTrapsandSpikesESP(color)
-    local ingameFolder = workspace:FindFirstChild("Map") 
-        and workspace.Map:FindFirstChild("Ingame")
-    if not ingameFolder then
-        warn("Ingame folder not found in Workspace.Map")
-        return
-    end
-
-    -- Recursive function to search inside a model for a part named "Hook1"
-    local function hasHook1(obj)
-        for _, child in ipairs(obj:GetDescendants()) do
-            if child:IsA("BasePart") and child.Name == "Hook1" then
-                return true
+do
+-- v3: Trap ESP is indexed once per map and incrementally maintained on instance additions.
+-- Avoid the old every-0.5s GetDescendants() scan with nested descendant searches.
+local trapFolder, trapAddedConnection
+local function trapHighlight(target)
+    if not target or target:FindFirstChild(TRAPSANDSPIKES_ESP_NAME) then return end
+    local hl = Instance.new("Highlight")
+    hl.Name = TRAPSANDSPIKES_ESP_NAME
+    hl.FillColor = COLOR_TRAPSANDSPIKES
+    hl.OutlineColor = Color3.new(1, 1, 1)
+    hl.Adornee = target
+    hl.Parent = target
+    setHighlightVisibility(hl, ESP.Enabled)
+    allHighlights[hl] = true
+end
+local function inspectTrapNode(node, ingame)
+    if not (node:IsA("BasePart") or node:IsA("Model")) then return end
+    local name = node.Name
+    if name == "Spike" or name == "SubspaceTripmine" or name == "Shadow" or name:find("RespawnLocation", 1, true) then
+        if name == "Shadow" or name:find("RespawnLocation", 1, true) then
+            if node:IsA("BasePart") then
+                if node.Transparency ~= 0 then node.Transparency = 0 end
+            elseif node:IsA("Model") then
+                for _, part in ipairs(node:GetDescendants()) do
+                    if part:IsA("BasePart") and part.Transparency ~= 0 then part.Transparency = 0 end
+                end
             end
         end
-        return false
-    end
-
-    -- Function to create a unique highlight if it doesn't already exist
-    local function ensureHighlight(target)
-        if not target:FindFirstChild("TrapsandSpikesESP") then
-            local hl = Instance.new("Highlight")
-            hl.Name = TRAPSANDSPIKES_ESP_NAME
-            hl.FillColor = color or Color3.fromRGB(255, 0, 0) -- default bright red
-            hl.OutlineColor = Color3.fromRGB(255, 255, 255)
-            hl.OutlineTransparency = 0
-            hl.FillTransparency = 0.8
-            hl.Adornee = target
-            hl.Parent = target
-
-            -- Add to global highlights table
-            allHighlights[hl] = true
+        trapHighlight(node)
+    elseif name == "Hook1" and node:IsA("BasePart") then
+        -- Highlight the smallest containing trap model instead of the entire level.
+        local parent = node.Parent
+        while parent and parent ~= ingame and not parent:IsA("Model") do
+            parent = parent.Parent
         end
-    end
-
-    -- Scan through all descendants in Ingame
-    for _, obj in ipairs(ingameFolder:GetDescendants()) do
-        if obj:IsA("Model") or obj:IsA("BasePart") then
-            if obj.Name == "Spike" or obj.Name == "SubspaceTripmine" then
-                ensureHighlight(obj)
-
-            elseif obj.Name == "Shadow" then
-                -- Set transparency to 0 for shadow parts
-                if obj:IsA("BasePart") then
-                    obj.Transparency = 0
-                elseif obj:IsA("Model") then
-                    for _, part in ipairs(obj:GetDescendants()) do
-                        if part:IsA("BasePart") then
-                            part.Transparency = 0
-                        end
-                    end
-                end
-                ensureHighlight(obj)
-            elseif hasHook1(obj) then
-                ensureHighlight(obj)
-            elseif typeof(obj.Name) == "string" and string.find(obj.Name, "RespawnLocation") then
-                if obj:IsA("BasePart") then
-                    obj.Transparency = 0
-                elseif obj:IsA("Model") then
-                    for _, part in ipairs(obj:GetDescendants()) do
-                        if part:IsA("BasePart") then
-                            part.Transparency = 0
-                        end
-                    end
-                end
-                ensureHighlight(obj)
-			end
-        end
+        if parent and parent ~= ingame and parent:IsA("Model") then trapHighlight(parent) end
     end
 end
+local function bindTrapFolder(ingame)
+    if not ingame or trapFolder == ingame then return end
+    if trapAddedConnection then trapAddedConnection:Disconnect(); trapAddedConnection = nil end
+    trapFolder = ingame
+    trapAddedConnection = ingame.DescendantAdded:Connect(function(node)
+        inspectTrapNode(node, ingame)
+    end)
+    task.spawn(function()
+        local nodes = ingame:GetDescendants()
+        for i, node in ipairs(nodes) do
+            if trapFolder ~= ingame or not ingame.Parent then return end
+            inspectTrapNode(node, ingame)
+            if i % 200 == 0 then task.wait() end -- bounded startup cost
+        end
+    end)
+end
+local function bindCurrentTrapMap()
+    local map = Workspace:FindFirstChild("Map")
+    local ingame = map and map:FindFirstChild("Ingame")
+    if ingame then bindTrapFolder(ingame) end
+end
+bindCurrentTrapMap()
+Workspace.ChildAdded:Connect(function(child)
+    if child.Name == "Map" then
+        local ingame = child:FindFirstChild("Ingame")
+        if ingame then bindTrapFolder(ingame) end
+        child.ChildAdded:Connect(function(part)
+            if part.Name == "Ingame" then bindTrapFolder(part) end
+        end)
+    end
+end)
+if not trapFolder then
+    -- In case the original Map container appears after startup.
+    task.spawn(function()
+        for _ = 1, 30 do
+            if trapFolder then return end
+            bindCurrentTrapMap()
+            task.wait(1)
+        end
+    end)
+end
+
+end -- scoped performance/UI helpers
 
 -- 独立的玩家 ESP：杀手红色、幸存者绿色，屏幕外 100% 透明，屏幕内 15% 透明。
 -- “视野中”按相机屏幕投影判断；隔墙但位于屏幕区域内仍会显示（ESP 穿墙特性）。
@@ -1717,10 +1728,14 @@ local function updatePlayerESP(record, camera)
     if highlight.OutlineColor ~= color then highlight.OutlineColor = color end
     if record.RoleLabel.TextColor3 ~= color then record.RoleLabel.TextColor3 = color end
 
-    local username = "用户名：" .. getESPUsername(character)
-    local role = "角色：" .. getESPRole(character)
-    if record.UsernameLabel.Text ~= username then record.UsernameLabel.Text = username end
-    if record.RoleLabel.Text ~= role then record.RoleLabel.Text = role end
+    local now = os.clock()
+    if now >= (record.NextMetadataUpdate or 0) then
+        local username = "用户名：" .. getESPUsername(character)
+        local role = "角色：" .. getESPRole(character)
+        if record.UsernameLabel.Text ~= username then record.UsernameLabel.Text = username end
+        if record.RoleLabel.Text ~= role then record.RoleLabel.Text = role end
+        record.NextMetadataUpdate = now + 1.0
+    end
 
     local root = character:FindFirstChild("HumanoidRootPart") or character:FindFirstChild("Head")
     if root and billboard.Adornee ~= root then
@@ -1846,6 +1861,7 @@ local function highlightToolIfNeeded(tool)
     end
 end
 
+do
 -- Generator ESP
 local function addGeneratorHighlight(model)
     if model:FindFirstChild(GENERATOR_ESP_NAME) then return end
@@ -1869,7 +1885,9 @@ local function removeGeneratorHighlight(model)
     end
 end
 
+local trackedGeneratorProgress = setmetatable({}, {__mode = "k"})
 local function trackGenerator(generator)
+    if trackedGeneratorProgress[generator] then return end
     local progress = generator:FindFirstChild("Progress")
     local instances = generator:FindFirstChild("Instances")
 
@@ -1884,7 +1902,13 @@ local function trackGenerator(generator)
         removeGeneratorHighlight(genModel)
     end
 
-    progress:GetPropertyChangedSignal("Value"):Connect(function()
+    trackedGeneratorProgress[generator] = progress:GetPropertyChangedSignal("Value"):Connect(function()
+        if not generator.Parent then
+            local connection = trackedGeneratorProgress[generator]
+            if connection then connection:Disconnect() end
+            trackedGeneratorProgress[generator] = nil
+            return
+        end
         if progress.Value >= 100 then
             removeGeneratorHighlight(genModel)
         else
@@ -1922,6 +1946,7 @@ workspace.DescendantAdded:Connect(function(obj)
 end)
 
 runEvery(0.5, function()
+    if not ESP.Enabled then return end -- No per-player discovery cost while ESP is off.
     -- 回合切换时回收旧角色 ESP，避免多局游戏后累积失效对象。
     for character, record in pairs(playerESPRecords) do
         if not character:IsDescendantOf(PlayersFolder)
@@ -1948,24 +1973,17 @@ runEvery(0.5, function()
         end
     end
 
-    -- This one used to scan the entire map each frame — now every 0.5s
-    applyTrapsandSpikesESP(COLOR_TRAPSANDSPIKES)
+    -- Trap ESP is event-driven; no full-map poll here.
 end)
 
--- Item ESP initial scan
-for _, tool in ipairs(Workspace:GetDescendants()) do
-    highlightToolIfNeeded(tool)
-end
-
--- Item ESP listen for new tools
+-- v3: Single asynchronous initial tool scan; future tools are handled by events.
+Workspace.DescendantAdded:Connect(highlightToolIfNeeded)
 task.spawn(function()
-    task.wait(0.5)
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        highlightToolIfNeeded(obj)
+    for i, tool in ipairs(Workspace:GetDescendants()) do
+        highlightToolIfNeeded(tool)
+        if i % 250 == 0 then task.wait() end
     end
 end)
-
-Workspace.DescendantAdded:Connect(highlightToolIfNeeded)
 
 -- Generator ESP loop
 -- Find map once (with retries), then track generators, plus a 0.5s poll for *new* generators
@@ -1985,13 +2003,10 @@ task.spawn(function()
         end
     end
 
-    -- watch for new generators appearing in-session (throttled)
-    for _, gen in ipairs(mapContainer:GetChildren()) do
-    	if gen.Name == "Generator" and gen:IsA("Model") and not gen:FindFirstChild(GENERATOR_ESP_NAME) then
-    	    trackGenerator(gen)
-        end
-    end
+    -- Later generators are already captured by Workspace.DescendantAdded.
 end)
+
+end -- scoped performance/UI helpers
 
 -- Function to toggle ESP on/off
 function ESP:SetEnabled(state)
@@ -2098,7 +2113,8 @@ local function createStatsTracker()
 
         task.spawn(function()
             while button.Parent do
-                task.wait(0.35)
+                task.wait(1.0)
+                if not screenGui.Enabled then continue end
                 if not LocalPlayer:IsDescendantOf(Players) then
                     button:Destroy()
                     return
@@ -2126,7 +2142,7 @@ local function createStatsTracker()
             local killCount = kills and kills.Value or "N/A"
             local emoteText = emotes and emotes.Value or "None"
 
-            button.Text = string.format(
+            local updatedText = string.format(
                 "%s\n游戏时长：%s\n幸存者胜场：%s | 败场：%s\n杀手胜场：%s | 败场：%s | 击杀：%s\n表情：%s",
                 LocalPlayer.Name,
                 timeText,
@@ -2134,6 +2150,7 @@ local function createStatsTracker()
                 kw, kl, killCount,
                 emoteText
             )
+            if button.Text ~= updatedText then button.Text = updatedText end
             end
         end)
     end
@@ -2151,8 +2168,9 @@ local function createStatsTracker()
     end)
 
     listLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-        scrollFrame.CanvasSize = UDim2.new(0, 0, 0, listLayout.AbsoluteContentSize.Y + 10)
+        scrollFrame.CanvasSize = UDim2.new(0, 0, 0, listLayout.AbsoluteContentSize.Y + 32)
     end)
+    scrollFrame.CanvasSize = UDim2.fromOffset(0, listLayout.AbsoluteContentSize.Y + 32)
 
     return screenGui
 end
@@ -3462,6 +3480,69 @@ else
     warn("Fluent not loaded; GUI controls unavailable. Core features remain active via defaults where possible.")
 end
 
+do
+-- v3: Fix incomplete scrolling in Fluent tab pages (including late-added Settings controls).
+-- Fluent's default canvas calculation only adds 2 px to the layout's height.
+-- Keep a real bottom safe area, adjust for container padding, and update when UI changes.
+local ScrollRepairConnections = {}
+local function RepairTabScroll(tab)
+    local frame = tab and (tab.ContainerFrame or tab.ScrollFrame or tab.Container)
+    if not frame or not frame:IsA("ScrollingFrame") then return end
+    local layout = frame:FindFirstChildOfClass("UIListLayout")
+    if not layout then return end
+    frame.Active = true
+    frame.ScrollingEnabled = true
+    frame.ScrollingDirection = Enum.ScrollingDirection.Y
+    frame.AutomaticCanvasSize = Enum.AutomaticSize.None
+    if IsMobile then
+        frame.ScrollBarThickness = 5
+        frame.ScrollBarImageTransparency = 0.45
+    end
+    local function requiredHeight()
+        local pad = frame:FindFirstChildOfClass("UIPadding")
+        local padY = 0
+        if pad then
+            -- Fluent creates pixel-valued UIPadding; scale-valued padding is uncommon here.
+            padY = pad.PaddingTop.Offset + pad.PaddingBottom.Offset
+            padY += (pad.PaddingTop.Scale + pad.PaddingBottom.Scale) * frame.AbsoluteSize.Y
+        end
+        return math.ceil(layout.AbsoluteContentSize.Y + padY + (IsMobile and 48 or 24))
+    end
+    local function refresh()
+        if not frame.Parent then return end
+        local minY = requiredHeight()
+        local canvas = frame.CanvasSize
+        if canvas.Y.Scale ~= 0 or canvas.Y.Offset < minY then
+            frame.CanvasSize = UDim2.fromOffset(0, minY)
+        end
+    end
+    -- Defer so upstream layout/canvas callbacks settle before applying the floor.
+    local pending = false
+    local function schedule()
+        if pending then return end
+        pending = true
+        task.defer(function()
+            pending = false
+            refresh()
+        end)
+    end
+    table.insert(ScrollRepairConnections, layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(schedule))
+    table.insert(ScrollRepairConnections, frame:GetPropertyChangedSignal("AbsoluteSize"):Connect(schedule))
+    table.insert(ScrollRepairConnections, frame:GetPropertyChangedSignal("CanvasSize"):Connect(schedule))
+    schedule()
+end
+if FluentLoaded and Tabs then
+    for _, tab in pairs(Tabs) do
+        RepairTabScroll(tab)
+    end
+    -- Left-side tab navigation can also clip the final item on a small display.
+    if Window and Window.TabHolder then
+        RepairTabScroll({ ContainerFrame = Window.TabHolder })
+    end
+end
+
+end -- scoped performance/UI helpers
+
 -- Ensure AutoRejoin default ON (original script created a connection by default)
 if not activeConnections.AutoRejoin and toggles.AutoRejoinOnKick then
     activeConnections.AutoRejoin = GuiService.ErrorMessageChanged:Connect(function(msg)
@@ -3575,17 +3656,12 @@ local function playCustomAnim(animId, isPunch)
     end
 end
 
-runEvery(0.1, function()
-    local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
-    local Humanoid = Character:FindFirstChild("Humanoid") or Character:WaitForChild("Humanoid")
-    local Animator = Humanoid:FindFirstChild("Animator") or Humanoid:WaitForChild("Animator")
-    local HumanoidRootPart = Character:FindFirstChild("HumanoidRootPart") or Character:WaitForChild("HumanoidRootPart")
-end)
+-- Removed a dead 10 Hz character lookup; it only created function-local shadows.
 
 coroutine.wrap(function()
     local hrp, c, vel, movel = nil, nil, nil, 0.1
     while true do
-        RunService.Heartbeat:Wait()
+        task.wait(hiddenfling and 0.016 or 0.25)
         if hiddenfling then
             while hiddenfling and not (c and c.Parent and hrp and hrp.Parent) do
                 RunService.Heartbeat:Wait()
@@ -3605,16 +3681,22 @@ coroutine.wrap(function()
     end
 end)()
 
--- auto block loop
-RunService.RenderStepped:Connect(function()
+do
+-- v3: Combat feature checks run on a bounded budget; disabled features do not scan players.
+local lastCombatScan = 0
+RunService.Heartbeat:Connect(function()
+    if not (GuestSettingsOn or blockTPEnabled or predictiveBlockOn or AutoPunchEnabled) then return end
+    local now = os.clock()
+    if now - lastCombatScan < 0.06 then return end
+    lastCombatScan = now
     local myChar = LocalPlayer.Character
     if not myChar then return end
     local myRoot = myChar:FindFirstChild("HumanoidRootPart")
     Humanoid = myChar:FindFirstChildOfClass("Humanoid")
         -- Auto Block: Trigger block if a valid animation is played by a killer
-    for _, plr in ipairs(Players:GetPlayers()) do
+    if GuestSettingsOn then for _, plr in ipairs(Players:GetPlayers()) do
         if plr ~= lp and plr.Character then
-			if not game.Players:GetPlayerFromCharacter(plr.Character) then return end
+            -- A player character is already sourced from Players:GetPlayers().
             local hrp = plr.Character:FindFirstChild("HumanoidRootPart")
             local hum = plr.Character:FindFirstChildOfClass("Humanoid")
             local animTracks = hum and hum:FindFirstChildOfClass("Animator") and hum:FindFirstChildOfClass("Animator"):GetPlayingAnimationTracks()
@@ -3637,6 +3719,8 @@ RunService.RenderStepped:Connect(function()
         end
     end
 
+    end -- GuestSettingsOn
+
     -- Detect if LocalPlayer is playing a block animation, and blockTP is enabled
     if blockTPEnabled and Humanoid and tick() - lastBlockTpTime >= 5 then
         for _, track in ipairs(Humanoid:GetPlayingAnimationTracks()) do
@@ -3650,7 +3734,6 @@ RunService.RenderStepped:Connect(function()
                             and workspace.Players:FindFirstChild("Killers")
                             and workspace.Players.Killers:FindFirstChild(name)
 
-						if not game.Players:GetPlayerFromCharacter(killer) then return end
 
                         if killer and killer:FindFirstChild("HumanoidRootPart") then
                             lastBlockTpTime = tick()
@@ -3733,7 +3816,6 @@ RunService.RenderStepped:Connect(function()
                     and workspace.Players:FindFirstChild("Killers")
                     and workspace.Players.Killers:FindFirstChild(name)
 
-				if not game.Players:GetPlayerFromCharacter(killer) then return end
 
                 if killer and killer:FindFirstChild("HumanoidRootPart") then
                     local root = killer.HumanoidRootPart
@@ -3810,6 +3892,8 @@ RunService.RenderStepped:Connect(function()
 
 end)
 
+end -- scoped performance/UI helpers
+
 -- Cooldown tracking for each replacement type
 local lastReplaceTime = {
     block = 0,
@@ -3820,7 +3904,9 @@ local lastReplaceTime = {
 -- Continuous custom animation replacer (runs forever if toggled on)
 task.spawn(function()
     while true do
-        RunService.Heartbeat:Wait()
+        local enabled = customBlockEnabled or customPunchEnabled or customChargeEnabled
+        task.wait(enabled and 0.08 or 0.4)
+        if not (customBlockEnabled or customPunchEnabled or customChargeEnabled) then continue end
 
         local char = LocalPlayer.Character
         if not char then continue end
@@ -3874,9 +3960,14 @@ task.spawn(function()
     end
 end)
 
---// Hitbox ride logic
+do
+--// Hitbox ride logic: check at 20Hz when enabled, instead of each frame.
+local lastHitboxScan = 0
 RunService.Heartbeat:Connect(function()
-	if not hitboxmodificationEnabled then return end
+    if not hitboxmodificationEnabled then return end
+    local now = os.clock()
+    if now - lastHitboxScan < 0.05 then return end
+    lastHitboxScan = now
 	if not HumanoidRootPart then return end
 
 	local playing = false
@@ -3923,12 +4014,12 @@ RunService.Heartbeat:Connect(function()
 	HumanoidRootPart.Velocity = oldVelocity
 end)
 
-RunService.RenderStepped:Connect(function()
-    if AntiSlow then
-		wait()
-        checkAndSetSlowStatus()
-        enforceMultipliers()
-    end
+end -- scoped performance/UI helpers
+
+runEvery(0.14, function()
+    if not AntiSlow then return end
+    checkAndSetSlowStatus()
+    enforceMultipliers()
 end)
 
 -- Select the first tab on load
